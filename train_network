@@ -1,0 +1,234 @@
+
+import csv
+import torch
+from pathlib import Path
+from collections import Counter
+
+# ==========================================
+# 1. CONFIGURATION
+# ==========================================
+
+torch.manual_seed(42)
+
+DATA_PATH = Path(__file__).parent / "data" / "rps_landmarks.csv"
+MODEL_PATH = Path(__file__).parent / "rps_model.pth"
+
+# Each label needs a numerical class index.
+LABELS = {"rock": 0, "paper": 1, "scissors": 2}
+CLASS_NAMES = ["rock", "paper", "scissors"]
+
+EPOCHS = 300
+LEARNING_RATE = 0.001
+
+
+# ==========================================
+# 2. LOAD THE DATA
+# ==========================================
+
+with open(DATA_PATH, newline="") as file:
+    rows = list(csv.DictReader(file))
+
+# Build a list of the 63 feature columns.
+feature_names = [
+    f"{axis}{i}"
+    for i in range(21)
+    for axis in ("x", "y", "z")
+]
+
+# Our collector creates a new session ID every run.
+sessions = sorted(set(row["session"] for row in rows))
+
+if len(sessions) != 2:
+    raise ValueError(
+        f"Expected exactly 2 recording sessions, found {len(sessions)}."
+    )
+
+# Session 1 is training data.
+# Session 2 is completely unseen test data.
+train_rows = [r for r in rows if r["session"] == sessions[0]]
+test_rows = [r for r in rows if r["session"] == sessions[1]]
+
+def prepare_data(selected_rows):
+    # X contains the 63 input features.
+    X = torch.tensor(
+        [[float(row[name]) for name in feature_names]
+         for row in selected_rows],
+        dtype=torch.float32
+    )
+
+    # y contains the correct class number: 0, 1, or 2.
+    y = torch.tensor(
+        [LABELS[row["label"]] for row in selected_rows],
+        dtype=torch.long
+    )
+
+    return X, y
+
+X_train, y_train = prepare_data(train_rows)
+X_test, y_test = prepare_data(test_rows)
+
+print("Training examples:", len(X_train))
+print("Testing examples:", len(X_test))
+print("Training labels:", Counter(r["label"] for r in train_rows))
+print("Testing labels:", Counter(r["label"] for r in test_rows))
+print("Input tensor shape:", X_train.shape)
+
+if not train_rows or not test_rows:
+    raise ValueError("Both sessions must contain examples.")
+
+if set(y_train.tolist()) != {0, 1, 2}:
+    raise ValueError("Training session must contain all three gestures.")
+
+
+# ==========================================
+# 3. BUILD THE NEURAL NETWORK
+# ==========================================
+
+class RPSNetwork(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+
+        self.layers = torch.nn.Sequential(
+            torch.nn.Linear(63, 32),
+            torch.nn.ReLU(),
+            torch.nn.Linear(32, 16),
+            torch.nn.ReLU(),
+            torch.nn.Linear(16, 3)
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+model = RPSNetwork()
+
+print("\nOUR NEURAL NETWORK:")
+print(model)
+
+print("Total learnable parameters:",
+      sum(p.numel() for p in model.parameters()))
+
+
+# ==========================================
+# 4. PREDICTIONS BEFORE TRAINING
+# ==========================================
+
+with torch.no_grad():
+    initial_scores = model(X_train[:1])
+    initial_probs = torch.softmax(initial_scores, dim=1)
+
+print("\nBEFORE TRAINING:")
+print("Actual gesture:", CLASS_NAMES[y_train[0].item()])
+print("Predicted probabilities:", initial_probs[0].tolist())
+
+
+# ==========================================
+# 5. DEFINE THE LEARNING PROCESS
+# ==========================================
+
+# Cross-entropy measures prediction error.
+loss_function = torch.nn.CrossEntropyLoss()
+
+# Adam updates the weights using gradients.
+optimizer = torch.optim.Adam(
+    model.parameters(),
+    lr=LEARNING_RATE
+)
+
+# Remember one weight so we can see it change.
+first_weight_before = model.layers[0].weight[0, 0].item()
+
+print("\nTRAINING BEGINS")
+
+# ==========================================
+# 6. TRAIN THE NETWORK
+# ==========================================
+
+for epoch in range(EPOCHS):
+
+    model.train()
+
+    # A. Forward pass: make predictions.
+    scores = model(X_train)
+
+    # B. Calculate loss using correct labels.
+    loss = loss_function(scores, y_train)
+
+    # C. Clear gradients from the last update.
+    optimizer.zero_grad()
+
+    # D. Backpropagation: calculate gradients.
+    loss.backward()
+
+    # E. Gradient descent (Adam): update weights.
+    optimizer.step()
+
+    # Print learning progress every 10 epochs.
+    if (epoch + 1) % 10 == 0 or epoch == 0:
+
+        predictions = scores.argmax(dim=1)
+        accuracy = (predictions == y_train).float().mean()
+
+        print(
+            f"Epoch {epoch+1:3d} | "
+            f"Loss: {loss.item():.4f} | "
+            f"Train accuracy: {accuracy.item()*100:.1f}%"
+        )
+
+
+# ==========================================
+# 7. SEE WHAT CHANGED
+# ==========================================
+
+first_weight_after = model.layers[0].weight[0, 0].item()
+
+print("\nONE WEIGHT BEFORE AND AFTER TRAINING:")
+print("Before:", first_weight_before)
+print("After: ", first_weight_after)
+
+
+# ==========================================
+# 8. TEST ON UNSEEN DATA
+# ==========================================
+
+model.eval()
+
+with torch.no_grad():
+
+    # These examples were NOT used to update weights.
+    test_scores = model(X_test)
+    test_loss = loss_function(test_scores, y_test)
+    print(f"Test loss: {test_loss.item():.4f}")
+    
+
+    test_probs = torch.softmax(test_scores, dim=1)
+    test_predictions = test_probs.argmax(dim=1)
+
+    test_accuracy = (
+        (test_predictions == y_test).float().mean().item()
+    )
+
+print(f"\nTEST ACCURACY: {test_accuracy*100:.1f}%")
+
+print("\nFIRST FIVE TEST PREDICTIONS:")
+
+for i in range(min(5, len(X_test))):
+    actual = CLASS_NAMES[y_test[i].item()]
+    predicted = CLASS_NAMES[test_predictions[i].item()]
+    confidence = test_probs[i].max().item()
+
+    print(
+        f"Actual: {actual:8s} | "
+        f"Predicted: {predicted:8s} | "
+        f"Confidence: {confidence*100:.1f}%"
+    )
+
+
+# ==========================================
+# 9. SAVE THE TRAINED WEIGHTS
+# ==========================================
+
+torch.save(model.state_dict(), MODEL_PATH)
+
+print("\nSaved trained model to:", MODEL_PATH)

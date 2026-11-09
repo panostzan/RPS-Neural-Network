@@ -1,0 +1,230 @@
+
+import cv2
+import csv
+import math
+import time
+import mediapipe as mp
+
+from pathlib import Path
+from datetime import datetime
+
+# -----------------------------------------
+# 1. CONFIGURATION
+# -----------------------------------------
+
+MODEL_PATH = Path(__file__).with_name("hand_landmarker.task")
+DATA_PATH = Path(__file__).parent / "data" / "rps_landmarks.csv"
+
+LABELS = {
+    ord("r"): "rock",
+    ord("p"): "paper",
+    ord("s"): "scissors"
+}
+
+# Every program run gets its own session ID.
+# Later, this helps us test on independent recordings.
+SESSION_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# Make sure the data folder exists.
+DATA_PATH.parent.mkdir(exist_ok=True)
+
+if not MODEL_PATH.exists():
+    raise FileNotFoundError(
+        f"Missing model: {MODEL_PATH}"
+    )
+
+# -----------------------------------------
+# 2. NORMALIZE THE LANDMARKS
+# -----------------------------------------
+
+def normalize_landmarks(landmarks, width, height):
+    """
+    Convert 21 hand landmarks into 63 features.
+
+    Step A: Convert coordinates to pixel-like units.
+    Step B: Subtract the wrist location.
+    Step C: Divide by hand size.
+
+    This reduces the effects of hand position
+    and distance from the camera.
+    """
+
+    # Landmark 0 is the wrist.
+    wrist = landmarks[0]
+
+    # Landmark 9 is the middle finger's base joint.
+    middle_base = landmarks[9]
+
+    # Approximate hand scale: wrist to middle base.
+    scale = math.hypot(
+        (middle_base.x - wrist.x) * width,
+        (middle_base.y - wrist.y) * height
+    )
+
+    # Avoid dividing by zero.
+    if scale < 1:
+        return None
+
+    features = []
+
+    for point in landmarks:
+
+        # Position relative to the wrist, divided
+        # by the size of the hand.
+        x = (point.x - wrist.x) * width / scale
+        y = (point.y - wrist.y) * height / scale
+        z = (point.z - wrist.z) * width / scale
+
+        features.extend([x, y, z])
+
+    return features
+
+
+# -----------------------------------------
+# 3. PREPARE OUR CSV FILE
+# -----------------------------------------
+
+# Create column names for all 63 features.
+feature_names = []
+
+for i in range(21):
+    feature_names.extend([f"x{i}", f"y{i}", f"z{i}"])
+
+columns = ["session", "label"] + feature_names
+
+# Write headers only if the file is new or empty.
+if not DATA_PATH.exists() or DATA_PATH.stat().st_size == 0:
+    with open(DATA_PATH, "w", newline="") as file:
+        csv.writer(file).writerow(columns)
+
+# Count samples collected during this session.
+counts = {"rock": 0, "paper": 0, "scissors": 0}
+
+# -----------------------------------------
+# 4. START MEDIAPIPE
+# -----------------------------------------
+
+options = mp.tasks.vision.HandLandmarkerOptions(
+    base_options=mp.tasks.BaseOptions(
+        model_asset_path=str(MODEL_PATH)
+    ),
+    running_mode=mp.tasks.vision.RunningMode.VIDEO,
+    num_hands=1
+)
+
+camera = cv2.VideoCapture(0)
+if not camera.isOpened():
+    raise RuntimeError("Could not open webcam.")
+
+start_time = time.monotonic()
+
+# Connections between landmarks for visualization.
+connections = mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS
+
+try:
+    with mp.tasks.vision.HandLandmarker.create_from_options(options) as detector:
+
+        while True:
+            success, frame = camera.read()
+
+            if not success:
+                break
+
+            # Mirror the image for easier interaction.
+            frame = cv2.flip(frame, 1)
+
+            height, width = frame.shape[:2]
+
+            # OpenCV uses BGR. MediaPipe expects RGB.
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=rgb
+            )
+
+            # VIDEO mode requires increasing timestamps.
+            timestamp = int((time.monotonic() - start_time) * 1000)
+
+            # Detect the hand.
+            result = detector.detect_for_video(mp_image, timestamp)
+
+            features = None
+
+            if result.hand_landmarks:
+
+                landmarks = result.hand_landmarks[0]
+
+                # Turn detected landmarks into 63 numbers.
+                features = normalize_landmarks(
+                    landmarks, width, height
+                )
+
+                # Draw lines between hand joints.
+                for connection in connections:
+                    start = landmarks[connection.start]
+                    end = landmarks[connection.end]
+
+                    p1 = (int(start.x * width), int(start.y * height))
+                    p2 = (int(end.x * width), int(end.y * height))
+
+                    cv2.line(frame, p1, p2, (0, 255, 0), 2)
+
+                # Draw circles on all landmarks.
+                for point in landmarks:
+                    px = int(point.x * width)
+                    py = int(point.y * height)
+
+                    cv2.circle(frame, (px, py), 4, (0, 0, 255), -1)
+
+            # Display recording instructions.
+            cv2.putText(
+                frame, "R=Rock  P=Paper  S=Scissors  Q=Quit",
+                (15, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (255, 255, 255), 2
+            )
+
+            status = (
+                f"Rock: {counts['rock']}  "
+                f"Paper: {counts['paper']}  "
+                f"Scissors: {counts['scissors']}"
+            )
+
+            cv2.putText(
+                frame, status, (15, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (0, 255, 255), 2
+            )
+
+            cv2.imshow("RPS Dataset Collector", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord("q"):
+                break
+
+            # -----------------------------------------
+            # 5. SAVE A LABELED TRAINING EXAMPLE
+            # -----------------------------------------
+
+            if key in LABELS and features is not None:
+
+                label = LABELS[key]
+
+                # One row = session, label, 63 features.
+                row = [SESSION_ID, label] + features
+
+                with open(DATA_PATH, "a", newline="") as file:
+                    csv.writer(file).writerow(row)
+
+                counts[label] += 1
+
+                print(f"Saved {label}: {counts[label]}")
+
+finally:
+    camera.release()
+    cv2.destroyAllWindows()
+
+print("\nCollection finished.")
+print("Samples collected this session:", counts)
+print("Dataset saved to:", DATA_PATH)
