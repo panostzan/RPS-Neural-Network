@@ -3,6 +3,7 @@
 I wanted to better understand how neural networks work so I built one combining two of my favourite topics (Computer Vision, and ML). I first Collected hand landmark data using MediaPipe and then trained a PyTorch neural network to classify Rock, Paper, and Scissors gestures in real time.
 
 ![Live RPS Neural Network Dashboard](media/Visualization.png)
+![Live RPS Neural Network Dashboard](media/NeuralNetworkExample.gif)
 
 ## 1. Turning a Hand Into Numbers
 
